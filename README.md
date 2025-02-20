@@ -1,3 +1,3 @@
-###LateX Copilot:
+## LateX Copilot:
 
 Autocomplete
