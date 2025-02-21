@@ -16,6 +16,18 @@ interface SuggestionRequest {
   cursorPosition: number;
 }
 
+interface EditRequest {
+  selectedText: string;
+  query: string;
+  contextBefore: string;
+  contextAfter: string;
+}
+
+interface LatexQueryRequest {
+  query: string;
+  content: string;
+}
+
 interface SuggestionResponse {
   suggestion: string;
   textAtRequest: string;
@@ -104,25 +116,142 @@ app.post('/api/latex-suggestion', async (req: Request<{}, {}, SuggestionRequest>
   }
 });
 
+app.post('/api/edit-suggestion', async (req: Request<{}, {}, EditRequest>, res: Response) => {
+  try {
+    const { selectedText, query, contextBefore, contextAfter } = req.body;
+
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: "gpt-4o-mini-2024-07-18",
+        messages: [
+          {
+            role: "system",
+            content: `You are a LaTeX editing assistant. Your task is to help modify LaTeX text while maintaining proper math mode usage and ensuring changes are coherent with the surrounding context.
+
+IMPORTANT RULES FOR MATH MODE:
+1. Only wrap the actual mathematical expressions/equations in $...$ or $$...$$
+2. Regular text, even when referring to formulas, should NOT be in math mode
+3. Never wrap entire sentences in math mode
+4. Preserve existing math mode delimiters unless explicitly asked to change them
+
+Examples:
+- CORRECT: "The quadratic formula is $-\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}$."
+- INCORRECT: $The quadratic formula is -\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}.$
+- CORRECT: "We can solve this using the equation $x^2 + 2x + 1 = 0$."
+- INCORRECT: $We can solve this using the equation x^2 + 2x + 1 = 0.$`
+          },
+          {
+            role: "user",
+            content: `Given this LaTeX text with the selected portion marked between <selection> tags:
+${contextBefore}<selection>${selectedText}</selection>${contextAfter}
+
+The user wants to: ${query}
+
+Please provide the complete updated text that should replace the selection.
+Make sure to:
+1. Only modify the selected portion unless the change requires minimal adjustments
+2. Ensure the changes are coherent with the surrounding context
+3. Follow the math mode rules strictly`
+          }
+        ],
+        temperature: 0.3,
+        max_tokens: 500,
+        stream: false
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const suggestion = response.data.choices[0].message.content.trim();
+    res.json({ suggestion });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to get suggestion' });
+  }
+});
+
+app.post('/api/latex-query', async (req: Request<{}, {}, LatexQueryRequest>, res: Response) => {
+  try {
+    const { query, content } = req.body;
+
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: "gpt-4o-mini-2024-07-18",
+        messages: [
+          {
+            role: "system",
+            content: `You are a LaTeX, math, and science expert assistant. Your task is to help users understand and work with LaTeX documents.
+
+RESPONSE FORMAT:
+1. Always format your responses in markdown
+2. Use backticks (\`) for inline code
+3. Use triple backticks (\`\`\`) for code blocks
+4. Use asterisks (*) for emphasis
+5. Use double asterisks (**) for strong emphasis
+6. Use proper markdown headers (# for main headers, ## for subheaders, etc.)
+7. For mathematical expressions:
+   - Use $...$ for inline math
+   - Use $$...$$ for display math
+8. Use proper markdown lists (-, *, or numbers)
+9. Use > for blockquotes
+10. Use proper line breaks between sections
+
+CONTENT GUIDELINES:
+1. Answer questions about the content and structure of LaTeX documents
+2. Explain mathematical concepts and notation used in the document
+3. Suggest improvements or point out potential issues
+4. Provide clear, concise explanations with examples when helpful
+
+When explaining math expressions:
+1. Reference the specific equations or expressions from the document
+2. Break down complex notation into simpler parts
+3. Explain the meaning and purpose of each component
+4. Use clear, accessible language while maintaining mathematical accuracy`
+          },
+          {
+            role: "user",
+            content: `Here is the LaTeX document:
+-------------------
+${content}
+-------------------
+
+Question: ${query}`
+          }
+        ],
+        temperature: 0.3,
+        max_tokens: 1000,
+        stream: false
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const suggestion = response.data.choices[0].message.content.trim();
+    res.json({ response: suggestion });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to get response' });
+  }
+});
+
 async function LLMSuggestion(text: string, cursorPosition: number): Promise<string> {
-  // Get only the relevant context before the cursor (last 100 characters)
-  const contextWindow = 100;
+  // Get context before the cursor (last 70 characters)
+  const contextWindow = 70;
   const start = Math.max(0, cursorPosition - contextWindow);
   const textUpToCursor = text.slice(start, cursorPosition);
   
   // If there's no content, don't suggest
   if (!textUpToCursor.trim()) return '';
-
-  const mathMode = detectMathMode(text, cursorPosition);
-
-  // Count unclosed braces in math content
-  let openBraces = 0;
-  if (mathMode.inMathMode) {
-    for (const char of mathMode.mathContent) {
-      if (char === '{') openBraces++;
-      if (char === '}') openBraces--;
-    }
-  }
 
   // Check if the text after cursor contains similar content
   const nextChars = text.slice(cursorPosition, cursorPosition + 50);
@@ -132,7 +261,46 @@ async function LLMSuggestion(text: string, cursorPosition: number): Promise<stri
   const lastChar = textUpToCursor.slice(-1);
   const needsSpace = lastChar && lastChar !== ' ' && lastChar !== '\n' && lastChar !== '{' && lastChar !== '\\';
 
-  const mathModeCommands = `Commands that MUST be in math mode ($...$ or $$...$$):
+  try {
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: "gpt-4o-mini-2024-07-18",
+        messages: [
+          {
+            role: "system",
+            content: `You are a LaTeX assistant. Your task is to provide intelligent autocompletions based on the context.
+
+IMPORTANT RULES FOR MATH MODE:
+1. Analyze the context to determine if we're in math mode (between $ or $$)
+2. ONLY mathematical expressions should be wrapped in $...$ or $$...$$
+3. Regular text must NEVER be in math mode, even when discussing math
+4. When mixing text and math, only wrap the actual formulas in $...$ or $$...$$
+
+CRITICAL: Math mode ($...$ or $$...$$) is ONLY for:
+- Actual mathematical expressions and equations
+- Individual mathematical symbols
+- Numbers when they are part of a mathematical expression
+
+Math mode is NEVER for:
+- Regular words or sentences
+- Explanatory text about math
+- Punctuation marks outside the math
+- Text that merely references or describes math
+
+Examples of CORRECT usage:
+✓ "The quadratic formula is $-\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}$."
+✓ "When $x > 0$, the function increases."
+✓ "Let $\\alpha$ be the angle between vectors $\\vec{u}$ and $\\vec{v}$."
+✓ "The equation $x^2 + 2x + 1 = 0$ has one solution."
+
+Examples of INCORRECT usage:
+✗ $The quadratic formula is -\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}.$
+✗ $When x > 0, the function increases$
+✗ $Let \\alpha$ be the angle between $\\vec{u}$ and $\\vec{v}$
+✗ $The equation x^2 + 2x + 1 = 0 has one solution$
+
+Commands that MUST be in math mode ($...$ or $$...$$):
 - Any numbers or mathematical operations (+, -, *, /, =, etc.)
 - \\texttt when containing numbers, symbols, or technical identifiers (e.g., $\\texttt{SHA-256}$)
 - All subscripts and superscripts (_x, ^2)
@@ -150,59 +318,26 @@ Commands that can be used outside math mode:
 - \\begin{itemize}, \\begin{enumerate}
 - Text formatting without mathematical content
 
-IMPORTANT SPACING RULES:
-1. If the text before your suggestion ends with a letter, number, or punctuation (like a period), START your suggestion with a space.
-2. Do NOT start with a space if the text ends with a space, newline, opening brace, or backslash.
-3. Do NOT add extra spaces if your suggestion starts with $, \\, or {.
-
 IMPORTANT COMPLETION RULES:
-1. The user has already typed: "${textUpToCursor}"
-2. ONLY provide the remaining part of the text/expression
-3. NEVER repeat what the user has already written
-4. Start your completion from where the cursor is
+1. Analyze the context to determine if we're in math mode
+2. The user has already typed: "${textUpToCursor}"
+3. ONLY provide the remaining part of the text/expression
+4. NEVER repeat what the user has already written
+5. Start your completion from where the cursor is
+6. If we're in math mode, ensure all math expressions are properly closed
+7. If we're not in math mode but need to suggest math, wrap ONLY the mathematical parts in delimiters
+
+SPACING RULES:
+1. If the text before your suggestion ends with a letter, number, or punctuation, START your suggestion with a space
+2. Do NOT start with a space if the text ends with a space, newline, opening brace, or backslash
+3. Do NOT add extra spaces if your suggestion starts with $, \\, or {
 
 Current text ends with: "${lastChar}"
-Space needed: ${needsSpace}`;
-
-  try {
-    const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: "gpt-4o-mini-2024-07-18",
-        messages: [
-          {
-            role: "system",
-            content: mathMode.inMathMode
-              ? `You are a LaTeX math assistant. The user is currently writing ${mathMode.isInline ? 'inline' : 'display'} math between ${mathMode.isInline ? 'single $' : 'double $$'} delimiters. Rules:
-1. Complete the mathematical expression including ALL closing delimiters.
-2. If there are unclosed braces '{', include the matching '}'.
-3. For inline math ($...$), make sure to end with a single $.
-4. For display math ($$...$$), make sure to end with $$.
-5. Never include explanatory text, only the completion.
-6. Never repeat text that's already written.
-7. Focus on completing the current expression.
-8. ONLY provide the remaining part, starting from the cursor position.
-9. If no meaningful completion is possible, return an empty string.
-
-Current number of unclosed braces: ${openBraces}
-Text already written: "${mathMode.mathContent}"`
-              : `You are a LaTeX text assistant. The user is currently writing in text mode (not between $ signs). Rules:
-1. Suggest only text mode LaTeX commands or regular text.
-2. If suggesting a command that uses braces (like \\section{...}), always include the closing brace.
-3. If suggesting an environment, always include both \\begin and \\end.
-4. Never repeat text that's already written.
-5. Focus on completing the current sentence or command.
-6. ONLY provide the remaining part, starting from the cursor position.
-7. If no meaningful completion is possible, return an empty string.
-8. IMPORTANT: Some commands must be wrapped in math mode delimiters. Follow these rules:
-
-${mathModeCommands}`
+Space needed: ${needsSpace}`
           },
           {
             role: "user",
-            content: mathMode.inMathMode
-              ? `Complete this LaTeX math expression, providing ONLY the part that comes after: ${mathMode.mathContent}`
-              : `Complete this text, providing ONLY the part that comes after: ${textUpToCursor}`
+            content: `Complete this text, providing ONLY the part that comes after: ${textUpToCursor}`
           }
         ],
         temperature: 0.3,
@@ -227,35 +362,9 @@ ${mathModeCommands}`
       return '';
     }
 
-    // If we're not in math mode and the suggestion contains commands that require math mode,
-    // wrap the suggestion in math delimiters
-    if (!mathMode.inMathMode) {
-      const requiresMathMode = (text: string): boolean => {
-        const patterns = [
-          /\\texttt\{[^}]*[0-9_^\\]/, // texttt with numbers, subscripts, or commands
-          /[0-9]+/,                    // numbers
-          /[+\-*/=]/,                  // mathematical operators
-          /\\(?:alpha|beta|gamma|delta|sum|prod|frac|sqrt)/, // math commands
-          /[_^]/                       // subscripts and superscripts
-        ];
-        return patterns.some(pattern => pattern.test(text));
-      };
-
-      if (requiresMathMode(suggestion)) {
-        suggestion = `$${suggestion}$`;
-      }
-    }
-
     // Add space before suggestion if needed and suggestion doesn't start with special characters
     if (needsSpace && !suggestion.match(/^[$\\{]/)) {
       suggestion = ' ' + suggestion;
-    }
-
-    // Remove any part that repeats the existing text
-    const existingText = textUpToCursor.toLowerCase();
-    const suggestionLower = suggestion.toLowerCase();
-    if (suggestionLower.startsWith(existingText)) {
-      suggestion = suggestion.slice(existingText.length);
     }
 
     return suggestion;
