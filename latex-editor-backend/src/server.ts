@@ -2,8 +2,18 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { OpenAI } from 'openai';
 
 dotenv.config();
+
+const client = new OpenAI({
+  apiKey: process.env.GROK_API_KEY,
+  baseURL: "https://api.x.ai/v1",
+});
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -120,14 +130,12 @@ app.post('/api/edit-suggestion', async (req: Request<{}, {}, EditRequest>, res: 
   try {
     const { selectedText, query, contextBefore, contextAfter } = req.body;
 
-    const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: "gpt-4o-mini-2024-07-18",
-        messages: [
-          {
-            role: "system",
-            content: `You are a LaTeX editing assistant. Your task is to help modify LaTeX text while maintaining proper math mode usage and ensuring changes are coherent with the surrounding context.
+    const response = await client.chat.completions.create({
+      model: "grok-2-latest",
+      messages: [
+        {
+          role: "system",
+          content: `You are a LaTeX editing assistant. Your task is to help modify LaTeX text while maintaining proper math mode usage and ensuring changes are coherent with the surrounding context.
 
 IMPORTANT RULES FOR MATH MODE:
 1. Only wrap the actual mathematical expressions/equations in $...$ or $$...$$
@@ -140,10 +148,10 @@ Examples:
 - INCORRECT: $The quadratic formula is -\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}.$
 - CORRECT: "We can solve this using the equation $x^2 + 2x + 1 = 0$."
 - INCORRECT: $We can solve this using the equation x^2 + 2x + 1 = 0.$`
-          },
-          {
-            role: "user",
-            content: `Given this LaTeX text with the selected portion marked between <selection> tags:
+        },
+        {
+          role: "user",
+          content: `Given this LaTeX text with the selected portion marked between <selection> tags:
 ${contextBefore}<selection>${selectedText}</selection>${contextAfter}
 
 The user wants to: ${query}
@@ -153,21 +161,13 @@ Make sure to:
 1. Only modify the selected portion unless the change requires minimal adjustments
 2. Ensure the changes are coherent with the surrounding context
 3. Follow the math mode rules strictly`
-          }
-        ],
-        temperature: 0.3,
-        max_tokens: 500,
-        stream: false
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
         }
-      }
-    );
+      ],
+      temperature: 0.3,
+      max_tokens: 500
+    });
 
-    const suggestion = response.data.choices[0].message.content.trim();
+    const suggestion = response.choices[0]?.message?.content?.trim() || selectedText;
     res.json({ suggestion });
   } catch (error) {
     console.error('Error:', error);
@@ -179,14 +179,12 @@ app.post('/api/latex-query', async (req: Request<{}, {}, LatexQueryRequest>, res
   try {
     const { query, content } = req.body;
 
-    const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: "gpt-4o-mini-2024-07-18",
-        messages: [
-          {
-            role: "system",
-            content: `You are a LaTeX, math, and science expert assistant. Your task is to help users understand and work with LaTeX documents.
+    const response = await client.chat.completions.create({
+      model: "grok-2-latest",
+      messages: [
+        {
+          role: "system",
+          content: `You are a LaTeX, math, and science expert assistant. Your task is to help users understand and work with LaTeX documents.
 
 RESPONSE FORMAT:
 1. Always format your responses in markdown
@@ -206,37 +204,23 @@ CONTENT GUIDELINES:
 1. Answer questions about the content and structure of LaTeX documents
 2. Explain mathematical concepts and notation used in the document
 3. Suggest improvements or point out potential issues
-4. Provide clear, concise explanations with examples when helpful
-
-When explaining math expressions:
-1. Reference the specific equations or expressions from the document
-2. Break down complex notation into simpler parts
-3. Explain the meaning and purpose of each component
-4. Use clear, accessible language while maintaining mathematical accuracy`
-          },
-          {
-            role: "user",
-            content: `Here is the LaTeX document:
+4. Provide clear, concise explanations with examples when helpful`
+        },
+        {
+          role: "user",
+          content: `Here is the LaTeX document:
 -------------------
 ${content}
 -------------------
 
 Question: ${query}`
-          }
-        ],
-        temperature: 0.3,
-        max_tokens: 1000,
-        stream: false
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
         }
-      }
-    );
+      ],
+      temperature: 0.3,
+      max_tokens: 1000
+    });
 
-    const suggestion = response.data.choices[0].message.content.trim();
+    const suggestion = response.choices[0]?.message?.content?.trim() || 'Failed to get response';
     res.json({ response: suggestion });
   } catch (error) {
     console.error('Error:', error);
@@ -245,15 +229,13 @@ Question: ${query}`
 });
 
 async function LLMSuggestion(text: string, cursorPosition: number): Promise<string> {
-  // Get context before the cursor (last 70 characters)
-  const contextWindow = 70;
-  const start = Math.max(0, cursorPosition - contextWindow);
-  const textUpToCursor = text.slice(start, cursorPosition);
+  // Get all text up to cursor position
+  const textUpToCursor = text.slice(0, cursorPosition);
   
   // If there's no content, don't suggest
   if (!textUpToCursor.trim()) return '';
 
-  // Check if the text after cursor contains similar content
+  // Get text after cursor for checking duplicates
   const nextChars = text.slice(cursorPosition, cursorPosition + 50);
   const lastWord = textUpToCursor.split(/[\s{}$]+/).pop() || '';
   
@@ -262,14 +244,14 @@ async function LLMSuggestion(text: string, cursorPosition: number): Promise<stri
   const needsSpace = lastChar && lastChar !== ' ' && lastChar !== '\n' && lastChar !== '{' && lastChar !== '\\';
 
   try {
-    const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: "gpt-4o-mini-2024-07-18",
-        messages: [
-          {
-            role: "system",
-            content: `You are a LaTeX assistant. Your task is to provide intelligent autocompletions based on the context.
+    const response = await client.chat.completions.create({
+      model: "grok-2-latest",
+      messages: [
+        {
+          role: "system",
+          content: `You are a LaTeX assistant. Your task is to provide intelligent autocompletions based on the context.
+You will be given the entire document up to the cursor position to understand the full context.
+Analyze what topics have been covered and what would be logical to discuss next.
 
 IMPORTANT RULES FOR MATH MODE:
 1. Analyze the context to determine if we're in math mode (between $ or $$)
@@ -300,59 +282,25 @@ Examples of INCORRECT usage:
 ✗ $Let \\alpha$ be the angle between $\\vec{u}$ and $\\vec{v}$
 ✗ $The equation x^2 + 2x + 1 = 0 has one solution$
 
-Commands that MUST be in math mode ($...$ or $$...$$):
-- Any numbers or mathematical operations (+, -, *, /, =, etc.)
-- \\texttt when containing numbers, symbols, or technical identifiers (e.g., $\\texttt{SHA-256}$)
-- All subscripts and superscripts (_x, ^2)
-- Mathematical symbols (\\alpha, \\beta, \\sum, \\prod, etc.)
-- Fractions (\\frac{}{})
-- Matrices and arrays
-- Equation environments
-- Any mathematical expressions or identifiers
-
-Commands that can be used outside math mode:
-- \\textit for plain text
-- \\textbf for plain text
-- \\emph
-- \\section, \\subsection
-- \\begin{itemize}, \\begin{enumerate}
-- Text formatting without mathematical content
-
-IMPORTANT COMPLETION RULES:
-1. Analyze the context to determine if we're in math mode
-2. The user has already typed: "${textUpToCursor}"
-3. ONLY provide the remaining part of the text/expression
-4. NEVER repeat what the user has already written
-5. Start your completion from where the cursor is
-6. If we're in math mode, ensure all math expressions are properly closed
-7. If we're not in math mode but need to suggest math, wrap ONLY the mathematical parts in delimiters
-
-SPACING RULES:
-1. If the text before your suggestion ends with a letter, number, or punctuation, START your suggestion with a space
-2. Do NOT start with a space if the text ends with a space, newline, opening brace, or backslash
-3. Do NOT add extra spaces if your suggestion starts with $, \\, or {
-
 Current text ends with: "${lastChar}"
 Space needed: ${needsSpace}`
-          },
-          {
-            role: "user",
-            content: `Complete this text, providing ONLY the part that comes after: ${textUpToCursor}`
-          }
-        ],
-        temperature: 0.3,
-        max_tokens: 100,
-        stream: false
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+        },
+        {
+          role: "user",
+          content: `Here is the entire document up to the cursor position:
+-------------------
+${textUpToCursor}
+-------------------
 
-    let suggestion = response.data.choices[0].message.content.trim();
+Based on this context, provide a completion that would naturally continue from this point.
+Return ONLY the text that should be inserted at the cursor position.`
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 150
+    });
+
+    let suggestion = response.choices[0]?.message?.content?.trim() || '';
     
     // Clean up the suggestion
     suggestion = suggestion.replace(/`/g, '').replace(/"/g, '').replace(/'/g, '');
@@ -369,7 +317,7 @@ Space needed: ${needsSpace}`
 
     return suggestion;
   } catch (error) {
-    console.error('OpenAI API error:', error);
+    console.error('Grok API error:', error);
     return '';
   }
 }
