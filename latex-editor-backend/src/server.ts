@@ -6,13 +6,17 @@ import fs from 'fs';
 import path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { OpenAI } from 'openai';
+import Groq from 'groq-sdk';
+import os from 'os';
 
 dotenv.config();
 
-const client = new OpenAI({
-  apiKey: process.env.GROK_API_KEY,
-  baseURL: "https://api.x.ai/v1",
+if (!process.env.GROQ_API_KEY) {
+  throw new Error('GROQ_API_KEY is not defined in environment variables');
+}
+
+const client = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
 const app = express();
@@ -50,6 +54,12 @@ interface MathModeInfo {
   mathContent: string;
   mathStart: number;
 }
+
+interface CompileRequest {
+  content: string;
+}
+
+const execAsync = promisify(exec);
 
 function detectMathMode(text: string, cursorPosition: number): MathModeInfo {
   // Look backwards from cursor to find the last unmatched $ or $$
@@ -131,7 +141,7 @@ app.post('/api/edit-suggestion', async (req: Request<{}, {}, EditRequest>, res: 
     const { selectedText, query, contextBefore, contextAfter } = req.body;
 
     const response = await client.chat.completions.create({
-      model: "grok-2-latest",
+      model: "llama-3.3-70b-versatile",
       messages: [
         {
           role: "system",
@@ -142,6 +152,13 @@ IMPORTANT RULES FOR MATH MODE:
 2. Regular text, even when referring to formulas, should NOT be in math mode
 3. Never wrap entire sentences in math mode
 4. Preserve existing math mode delimiters unless explicitly asked to change them
+
+RESPONSE REQUIREMENTS:
+1. Provide COMPLETE responses - never leave sentences unfinished
+2. Always end your response with proper punctuation
+3. Make sure your response is self-contained and makes sense on its own
+4. If you're explaining a concept, provide a complete explanation
+5. If you're providing an example, make sure it's complete
 
 Examples:
 - CORRECT: "The quadratic formula is $-\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}$."
@@ -160,11 +177,13 @@ Please provide the complete updated text that should replace the selection.
 Make sure to:
 1. Only modify the selected portion unless the change requires minimal adjustments
 2. Ensure the changes are coherent with the surrounding context
-3. Follow the math mode rules strictly`
+3. Follow the math mode rules strictly
+4. Provide a COMPLETE response - never leave sentences or explanations unfinished
+5. End your response with proper punctuation`
         }
       ],
       temperature: 0.3,
-      max_tokens: 500
+      max_tokens: 1000
     });
 
     const suggestion = response.choices[0]?.message?.content?.trim() || selectedText;
@@ -180,7 +199,7 @@ app.post('/api/latex-query', async (req: Request<{}, {}, LatexQueryRequest>, res
     const { query, content } = req.body;
 
     const response = await client.chat.completions.create({
-      model: "grok-2-latest",
+      model: "llama-3.3-70b-versatile",
       messages: [
         {
           role: "system",
@@ -229,14 +248,18 @@ Question: ${query}`
 });
 
 async function LLMSuggestion(text: string, cursorPosition: number): Promise<string> {
-  // Get all text up to cursor position
-  const textUpToCursor = text.slice(0, cursorPosition);
+  // Get context around cursor
+  const maxContextBefore = 400;
+  const maxContextAfter = 250;
+  
+  const textUpToCursor = text.slice(Math.max(0, cursorPosition - maxContextBefore), cursorPosition);
+  const textAfterCursor = text.slice(cursorPosition, Math.min(text.length, cursorPosition + maxContextAfter));
   
   // If there's no content, don't suggest
   if (!textUpToCursor.trim()) return '';
 
   // Get text after cursor for checking duplicates
-  const nextChars = text.slice(cursorPosition, cursorPosition + 50);
+  const nextChars = textAfterCursor.slice(0, 50);
   const lastWord = textUpToCursor.split(/[\s{}$]+/).pop() || '';
   
   // Check if we need a space before the suggestion
@@ -245,13 +268,23 @@ async function LLMSuggestion(text: string, cursorPosition: number): Promise<stri
 
   try {
     const response = await client.chat.completions.create({
-      model: "grok-2-latest",
+      model: "llama-3.3-70b-versatile",
       messages: [
         {
           role: "system",
-          content: `You are a LaTeX assistant. Your task is to provide intelligent autocompletions based on the context.
-You will be given the entire document up to the cursor position to understand the full context.
-Analyze what topics have been covered and what would be logical to discuss next.
+          content: `You are a LaTeX assistant providing natural, contextual autocompletions.
+
+SUGGESTION GUIDELINES:
+1. Your suggestion should naturally complete the current thought or introduce a closely related idea
+2. Keep suggestions focused and self-contained - one clear idea per suggestion
+3. Avoid overly long explanations or multiple concepts in one suggestion
+4. Each suggestion should be meaningful on its own while fitting the context
+5. Balance brevity with completeness - don't sacrifice clarity for shortness
+6. Pay careful attention to punctuation and sentence structure:
+   - If the previous text ends with a period, start a new complete sentence
+   - If the previous text doesn't end with punctuation, continue the sentence naturally
+   - Never start with "which," "where," or other dependent clauses after a period
+   - Ensure proper punctuation at both the start and end of the suggestion
 
 IMPORTANT RULES FOR MATH MODE:
 1. Analyze the context to determine if we're in math mode (between $ or $$)
@@ -259,45 +292,39 @@ IMPORTANT RULES FOR MATH MODE:
 3. Regular text must NEVER be in math mode, even when discussing math
 4. When mixing text and math, only wrap the actual formulas in $...$ or $$...$$
 
-CRITICAL: Math mode ($...$ or $$...$$) is ONLY for:
-- Actual mathematical expressions and equations
-- Individual mathematical symbols
-- Numbers when they are part of a mathematical expression
+Examples of GOOD suggestions:
+Text: "The quadratic formula is $-\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}$."
+<Suggestion>This formula solves equations of the form $ax^2 + bx + c = 0$.</Suggestion>
 
-Math mode is NEVER for:
-- Regular words or sentences
-- Explanatory text about math
-- Punctuation marks outside the math
-- Text that merely references or describes math
+Text: "The quadratic formula is $-\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}$"
+<Suggestion>, which solves equations of the form $ax^2 + bx + c = 0$.</Suggestion>
 
-Examples of CORRECT usage:
-✓ "The quadratic formula is $-\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}$."
-✓ "When $x > 0$, the function increases."
-✓ "Let $\\alpha$ be the angle between vectors $\\vec{u}$ and $\\vec{v}$."
-✓ "The equation $x^2 + 2x + 1 = 0$ has one solution."
+Text: "For a continuous function $f(x)$"
+<Suggestion> defined on the interval $[a,b]$, the Mean Value Theorem states that</Suggestion>
 
-Examples of INCORRECT usage:
-✗ $The quadratic formula is -\\frac{b \\pm \\sqrt{b^2 - 4ac}}{2a}.$
-✗ $When x > 0, the function increases$
-✗ $Let \\alpha$ be the angle between $\\vec{u}$ and $\\vec{v}$
-✗ $The equation x^2 + 2x + 1 = 0 has one solution$
+Examples of BAD suggestions:
+Wrong punctuation: "The formula is $x^2$." + "which is a square." (Never start with "which" after a period)
+Incomplete thought: "where $x$ represents" (lacks completion)
+Poor flow: "The equation. And then we can solve it" (abrupt transition)
+Too verbose: "This leads us to an interesting discussion of the properties of quadratic equations and their applications in various fields..."
 
 Current text ends with: "${lastChar}"
 Space needed: ${needsSpace}`
         },
         {
           role: "user",
-          content: `Here is the entire document up to the cursor position:
+          content: `Here is the relevant portion of the document with the cursor position marked by <Suggestion>:
 -------------------
-${textUpToCursor}
+${textUpToCursor}<Suggestion>${textAfterCursor}
 -------------------
 
-Based on this context, provide a completion that would naturally continue from this point.
-Return ONLY the text that should be inserted at the cursor position.`
+Provide a natural continuation that would fit between the text before and after the <Suggestion> tags.
+The suggestion should be concise but complete, forming a natural bridge between the text before and after (if any).
+Return ONLY the text that should be inserted (without the <Suggestion> tags).`
         }
       ],
       temperature: 0.3,
-      max_tokens: 150
+      max_tokens: 300
     });
 
     let suggestion = response.choices[0]?.message?.content?.trim() || '';
@@ -317,10 +344,61 @@ Return ONLY the text that should be inserted at the cursor position.`
 
     return suggestion;
   } catch (error) {
-    console.error('Grok API error:', error);
+    console.error('Groq API error:', error);
     return '';
   }
 }
+
+async function compileLaTeX(content: string): Promise<string> {
+  // Create a temporary directory
+  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'latex-'));
+  const texFile = path.join(tmpDir, 'document.tex');
+  const pdfFile = path.join(tmpDir, 'document.pdf');
+
+  try {
+    // Write the LaTeX content to a file
+    const fullContent = `
+\\documentclass{article}
+\\usepackage{amsmath}
+\\usepackage{amssymb}
+\\usepackage{amsfonts}
+\\usepackage{graphicx}
+\\usepackage{hyperref}
+\\begin{document}
+${content}
+\\end{document}`;
+
+    await fs.promises.writeFile(texFile, fullContent);
+
+    // Run pdflatex
+    await execAsync(`pdflatex -interaction=nonstopmode -output-directory=${tmpDir} ${texFile}`);
+
+    // Read the generated PDF
+    const pdfContent = await fs.promises.readFile(pdfFile);
+    return pdfContent.toString('base64');
+  } catch (error) {
+    console.error('LaTeX compilation error:', error);
+    throw new Error('Failed to compile LaTeX document');
+  } finally {
+    // Clean up temporary files
+    try {
+      await fs.promises.rm(tmpDir, { recursive: true });
+    } catch (error) {
+      console.error('Error cleaning up temporary files:', error);
+    }
+  }
+}
+
+app.post('/api/compile', async (req: Request<{}, {}, CompileRequest>, res: Response) => {
+  try {
+    const { content } = req.body;
+    const pdfBase64 = await compileLaTeX(content);
+    res.json({ pdf: pdfBase64 });
+  } catch (error) {
+    console.error('Compilation error:', error);
+    res.status(500).json({ error: 'Failed to compile document' });
+  }
+});
 
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
